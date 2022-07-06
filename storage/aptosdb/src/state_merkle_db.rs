@@ -1,7 +1,11 @@
 // Copyright (c) Aptos
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::schema::jellyfish_merkle_node::JellyfishMerkleNodeSchema;
+use crate::{
+    lru_node_cache::LruNodeCache,
+    metrics::{CACHE_MISS_READ, CACHE_MISS_TOTAL, LRU_CACHE, VERSION_CACHE},
+    schema::jellyfish_merkle_node::JellyfishMerkleNodeSchema,
+};
 use anyhow::Result;
 use aptos_crypto::{hash::CryptoHash, HashValue};
 use aptos_jellyfish_merkle::{
@@ -14,25 +18,33 @@ use aptos_types::{
     transaction::Version,
 };
 use schemadb::{SchemaBatch, DB};
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::{collections::HashMap, ops::Deref, sync::Arc, time::Instant};
 
 pub(crate) type LeafNode = aptos_jellyfish_merkle::node_type::LeafNode<StateKey>;
 pub(crate) type Node = aptos_jellyfish_merkle::node_type::Node<StateKey>;
 type NodeBatch = aptos_jellyfish_merkle::NodeBatch<StateKey>;
 
 #[derive(Debug)]
-pub struct StateMerkleDb(Arc<DB>);
+pub struct StateMerkleDb {
+    db: Arc<DB>,
+    version_cache: VersionedNodeCache,
+    lru_cache: LruNodeCache,
+}
 
 impl Deref for StateMerkleDb {
     type Target = DB;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.db
     }
 }
 
 impl StateMerkleDb {
     pub fn new(state_merkle_rocksdb: Arc<DB>) -> Self {
-        Self(state_merkle_rocksdb)
+        Self {
+            db: state_merkle_rocksdb,
+            version_cache: VersionedNodeCache::new(),
+            lru_cache: LruNodeCache::new(4 * 1024 * 128),
+        }
     }
 
     pub fn get_with_proof(
@@ -101,7 +113,35 @@ impl StateMerkleDb {
 
 impl TreeReader<StateKey> for StateMerkleDb {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
-        self.get::<JellyfishMerkleNodeSchema>(node_key)
+        let mut t = Instant::now();
+        if (VERSION_CACHE.get_sample_count()
+            + LRU_CACHE.get_sample_count()
+            + CACHE_MISS_TOTAL.get_sample_count())
+        .checked_rem(131072)
+            == Some(0)
+        {
+            println!("version_cache_hit: {} {}, lru_cache: {}, {}, version_cache_miss: {}, {}, cache_miss_total: {}, {}",
+                VERSION_CACHE.get_sample_count(), VERSION_CACHE.get_sample_sum() / VERSION_CACHE.get_sample_count() as f64, LRU_CACHE.get_sample_count(), LRU_CACHE.get_sample_sum() / LRU_CACHE.get_sample_count() as f64, CACHE_MISS_READ.get_sample_count(), CACHE_MISS_READ.get_sample_sum() / CACHE_MISS_READ.get_sample_count() as f64, CACHE_MISS_TOTAL.get_sample_count(), CACHE_MISS_TOTAL.get_sample_sum() / CACHE_MISS_TOTAL.get_sample_count() as f64);
+        }
+        let node_opt = if let Some(node_cache) = self.version_cache.get_version(node_key.version())
+        {
+            node_cache.get(node_key).cloned()
+        } else {
+            CACHE_MISS_READ.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+            t = Instant::now();
+            if let Some(node) = self.lru_cache.get(node_key) {
+                LRU_CACHE.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+                Some(node)
+            } else {
+                let node_opt = self.get::<JellyfishMerkleNodeSchema>(node_key)?;
+                if let Some(node) = &node_opt {
+                    self.lru_cache.put(node_key.clone(), node.clone());
+                }
+                CACHE_MISS_TOTAL.observe(t.elapsed().as_secs_f64() * 1000000000.0);
+                node_opt
+            }
+        };
+        Ok(node_opt)
     }
 
     fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
