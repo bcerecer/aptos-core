@@ -3,8 +3,9 @@
 
 use crate::{
     backend::k8s::node::{K8sNode, REST_API_PORT},
-    create_k8s_client, query_sequence_numbers, set_validator_image_tag, ChainInfo, FullNode, Node,
-    Result, Swarm, Validator, Version,
+    create_k8s_client, query_sequence_numbers, set_validator_image_tag,
+    uninstall_testnet_resources, ChainInfo, FullNode, Node, Result, Swarm, Validator, Version,
+    MANAGEMENT_CONFIGMAP_PREFIX,
 };
 use ::aptos_logger::*;
 use anyhow::{anyhow, bail, format_err};
@@ -15,13 +16,21 @@ use aptos_sdk::{
     move_types::account_address::AccountAddress,
     types::{chain_id::ChainId, AccountKey, LocalAccount, PeerId},
 };
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{ConfigMap, Service};
 use kube::{
-    api::{Api, ListParams},
+    api::{Api, ListParams, ObjectMeta, PostParams},
     client::Client as K8sClient,
 };
-use std::{collections::HashMap, convert::TryFrom, env, net::TcpListener, str, sync::Arc};
-use tokio::time::Duration;
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::TryFrom,
+    env,
+    net::TcpListener,
+    str,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::{runtime::Runtime, time::Duration};
 
 const VALIDATOR_LB: &str = "validator-lb";
 const FULLNODES_LB: &str = "fullnode-lb";
@@ -35,6 +44,7 @@ pub struct K8sSwarm {
     versions: Arc<HashMap<Version, String>>,
     pub chain_id: ChainId,
     kube_namespace: String,
+    keep: bool,
 }
 
 impl K8sSwarm {
@@ -45,6 +55,7 @@ impl K8sSwarm {
         kube_namespace: &str,
         validators: HashMap<AccountAddress, K8sNode>,
         fullnodes: HashMap<AccountAddress, K8sNode>,
+        keep: bool,
     ) -> Result<Self> {
         let kube_client = create_k8s_client().await;
 
@@ -69,7 +80,7 @@ impl K8sSwarm {
         versions.insert(base_version, base_image_tag.to_string());
         versions.insert(cur_version, image_tag.to_string());
 
-        Ok(Self {
+        let swarm = Self {
             validators,
             fullnodes,
             root_account,
@@ -77,7 +88,43 @@ impl K8sSwarm {
             chain_id: ChainId::new(4),
             versions: Arc::new(versions),
             kube_namespace: kube_namespace.to_string(),
-        })
+            keep,
+        };
+
+        swarm.create_management_configmap().await?;
+
+        Ok(swarm)
+    }
+
+    pub async fn create_management_configmap(&self) -> Result<()> {
+        let configmap: Api<ConfigMap> =
+            Api::namespaced(self.kube_client.clone(), &self.kube_namespace);
+
+        let pp = PostParams::default();
+
+        let mut data: BTreeMap<String, String> = BTreeMap::new();
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        data.insert("keep".to_string(), self.keep.to_string());
+        data.insert("start".to_string(), since_the_epoch.to_string());
+
+        let config = ConfigMap {
+            binary_data: None,
+            data: Some(data),
+            metadata: ObjectMeta {
+                name: Some(format!(
+                    "{}-{}",
+                    MANAGEMENT_CONFIGMAP_PREFIX, &self.kube_namespace
+                )),
+                ..ObjectMeta::default()
+            },
+        };
+        configmap.create(&pp, &config).await?;
+
+        Ok(())
     }
 
     fn get_rest_api_url(&self) -> String {
@@ -205,7 +252,7 @@ pub fn k8s_wait_genesis_strategy() -> impl Iterator<Item = Duration> {
 
 /// Amount of time to wait for nodes to respond on the REST API
 pub fn k8s_wait_nodes_strategy() -> impl Iterator<Item = Duration> {
-    ExponentWithLimitDelay::new(1000, 10 * 1000, 10 * 60 * 1000)
+    ExponentWithLimitDelay::new(1000, 10 * 1000, 15 * 60 * 1000)
 }
 
 #[derive(Clone, Debug)]
@@ -381,4 +428,17 @@ pub async fn nodes_healthcheck(nodes: Vec<&K8sNode>) -> Result<Vec<String>> {
     }
 
     Ok(unhealthy_nodes)
+}
+
+impl Drop for K8sSwarm {
+    fn drop(&mut self) {
+        let runtime = Runtime::new().unwrap();
+        if !self.keep {
+            runtime
+                .block_on(uninstall_testnet_resources(self.kube_namespace.clone()))
+                .unwrap();
+        } else {
+            println!("Keeping kube_namespace {}", self.kube_namespace);
+        }
+    }
 }

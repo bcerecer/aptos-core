@@ -9,9 +9,9 @@ use anyhow::{bail, format_err};
 use aptos_logger::info;
 use aptos_sdk::types::PeerId;
 use k8s_openapi::api::{
-    apps::v1::StatefulSet,
+    apps::v1::{Deployment, StatefulSet},
     batch::v1::Job,
-    core::v1::{Namespace, PersistentVolumeClaim},
+    core::v1::{ConfigMap, Namespace, PersistentVolumeClaim, Pod},
 };
 use kube::{
     api::{Api, DeleteParams, ListParams, Meta},
@@ -28,6 +28,7 @@ use std::{
     io::Write,
     process::{Command, Stdio},
     str,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
 
@@ -38,6 +39,10 @@ const APTOS_NODE_HELM_RELEASE_NAME: &str = "aptos-node";
 const GENESIS_HELM_RELEASE_NAME: &str = "genesis";
 const APTOS_NODE_HELM_CHART_PATH: &str = "terraform/helm/aptos-node";
 const GENESIS_HELM_CHART_PATH: &str = "terraform/helm/genesis";
+// cleanup namespaces after 30 min unless "keep = true"
+const NAMESPACE_CLEANUP_THRESHOLD_SECS: u64 = 1800;
+const POD_CLEANUP_THRESHOLD_SECS: u64 = 86400;
+pub const MANAGEMENT_CONFIGMAP_PREFIX: &str = "forge-management";
 
 async fn wait_genesis_job(kube_client: &K8sClient, era: &str, kube_namespace: &str) -> Result<()> {
     aptos_retrier::retry_async(k8s_wait_genesis_strategy(), || {
@@ -133,11 +138,12 @@ pub fn set_validator_image_tag(
 async fn delete_k8s_collection<T: Clone + DeserializeOwned + Meta>(
     api: Api<T>,
     name: &'static str,
+    label_selector: &str,
 ) -> Result<()> {
     match api
         .delete_collection(
             &DeleteParams::default(),
-            &ListParams::default().labels("app.kubernetes.io/part-of=aptos-node"),
+            &ListParams::default().labels(label_selector),
         )
         .await?
     {
@@ -159,19 +165,16 @@ pub(crate) async fn delete_k8s_cluster(kube_namespace: String) -> Result<()> {
     // if operating on the default namespace,
     match kube_namespace.as_str() {
         "default" => {
+            let deployments: Api<Deployment> = Api::namespaced(client.clone(), "default");
+            let stateful_sets: Api<StatefulSet> = Api::namespaced(client.clone(), "default");
             let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), "default");
 
             // delete all deployments and statefulsets
             // cross this with all the compute resources created by aptos-node helm chart
-            uninstall_helm_release(
-                APTOS_NODE_HELM_RELEASE_NAME.to_string(),
-                kube_namespace.clone(),
-            )?;
-            uninstall_helm_release(
-                GENESIS_HELM_RELEASE_NAME.to_string(),
-                kube_namespace.clone(),
-            )?;
-            delete_k8s_collection(pvcs, "pvcs").await?;
+            let aptos_node_helm_selector = "app.kubernetes.io/part-of=aptos-node";
+            delete_k8s_collection(deployments, "deployments", aptos_node_helm_selector).await?;
+            delete_k8s_collection(stateful_sets, "stateful_sets", aptos_node_helm_selector).await?;
+            delete_k8s_collection(pvcs, "pvcs", aptos_node_helm_selector).await?;
         }
         s if s.starts_with("forge") => {
             let namespaces: Api<Namespace> = Api::all(client);
@@ -192,30 +195,6 @@ pub(crate) async fn delete_k8s_cluster(kube_namespace: String) -> Result<()> {
     Ok(())
 }
 
-fn uninstall_helm_release(release_name: String, kube_namespace: String) -> Result<()> {
-    let uninstall_args = [
-        "uninstall".to_string(),
-        "--namespace".to_string(),
-        kube_namespace.clone(),
-        "--keep-history".to_string(),
-        release_name.clone(),
-    ];
-    info!("{:?}", uninstall_args);
-    // do not error on exit code, as helm uninstall is not idempotent
-    let _uninstall_output = Command::new(HELM_BIN)
-        .stdout(Stdio::inherit())
-        .args(&uninstall_args)
-        .output()
-        .unwrap_or_else(|_| {
-            panic!(
-                "failed to helm uninstall release {} from namespace {}",
-                release_name, kube_namespace
-            )
-        });
-
-    Ok(())
-}
-
 fn upgrade_helm_release(
     release_name: String,
     helm_chart: String,
@@ -229,9 +208,10 @@ fn upgrade_helm_release(
     };
     let upgrade_base_args = [
         "upgrade".to_string(),
+        // "--debug".to_string(),
         "--install".to_string(),
-        // force replace if necessary
-        "--force".to_string(),
+        // // force replace if necessary
+        // "--force".to_string(),
         // in a new namespace
         "--create-namespace".to_string(),
         "--namespace".to_string(),
@@ -243,10 +223,9 @@ fn upgrade_helm_release(
         "--reuse-values".to_string(),
         "--history-max".to_string(),
         "2".to_string(),
-        "--set".to_string(),
-        psp_values.to_string(),
     ];
-    let upgrade_args = [&upgrade_base_args, options].concat();
+    let upgrade_override_args = ["--set".to_string(), psp_values.to_string()];
+    let upgrade_args = [&upgrade_base_args, options, &upgrade_override_args].concat();
     info!("{:?}", upgrade_args);
     let upgrade_output = Command::new(HELM_BIN)
         .stdout(Stdio::inherit())
@@ -348,13 +327,6 @@ pub async fn install_testnet_resources(
         format!("imageTag={}", &base_genesis_image_tag),
     ];
 
-    // TODO(rustielin): get the helm releases to be consistent
-    upgrade_aptos_node_helm(
-        APTOS_NODE_HELM_RELEASE_NAME.to_string(),
-        aptos_node_upgrade_options.as_slice(),
-        kube_namespace.clone(),
-    )?;
-
     let mut genesis_upgrade_options = vec![
         // use the old values
         "-f".to_string(),
@@ -383,6 +355,13 @@ pub async fn install_testnet_resources(
 
     // wait for genesis to run again, and get the updated validators
     wait_genesis_job(&kube_client, &new_era, &kube_namespace).await?;
+
+    // TODO(rustielin): get the helm releases to be consistent
+    upgrade_aptos_node_helm(
+        APTOS_NODE_HELM_RELEASE_NAME.to_string(),
+        aptos_node_upgrade_options.as_slice(),
+        kube_namespace.clone(),
+    )?;
 
     // get all validators
     let validators = get_validators(
@@ -505,4 +484,90 @@ fn dump_helm_values_to_file(helm_release_name: &str, tmp_dir: &TempDir) -> Resul
         .display()
         .to_string();
     Ok(file_path_str)
+}
+
+pub async fn cleanup_cluster_with_management() -> Result<()> {
+    let kube_client = create_k8s_client().await;
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs();
+
+    let pods_api: Api<Pod> = Api::namespaced(kube_client.clone(), "default");
+    let lp = ListParams::default().labels("run");
+
+    // delete all forge test pods over a threshold age
+    let pods = pods_api
+        .list(&lp)
+        .await?
+        .items
+        .into_iter()
+        .filter(|pod| {
+            let pod_name = pod.name();
+            info!("Got pod {}", pod_name);
+            if let Some(time) = &pod.metadata.creation_timestamp {
+                let pod_creation_time = time.0.timestamp() as u64;
+                let pod_uptime = since_the_epoch - pod_creation_time;
+                info!(
+                    "Pod {} has lived for {}/{} seconds",
+                    pod_name, pod_uptime, POD_CLEANUP_THRESHOLD_SECS
+                );
+                if pod_uptime > POD_CLEANUP_THRESHOLD_SECS {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect::<Vec<Pod>>();
+    for pod in pods {
+        let pod_name = pod.name();
+        info!("Deleting pod {}", pod_name);
+        pods_api.delete(&pod_name, &DeleteParams::default()).await?;
+    }
+
+    // delete all forge testnets over a threshold age using their management configmaps
+    // unless they are explicitly set with "keep = true"
+    let configmaps_api: Api<ConfigMap> = Api::all(kube_client.clone());
+    let lp = ListParams::default();
+    let configmaps = configmaps_api
+        .list(&lp)
+        .await?
+        .items
+        .into_iter()
+        .filter(|configmap| {
+            let configmap_name = configmap.name();
+            let configmap_namespace = configmap.namespace().unwrap();
+            if !configmap_name.contains(MANAGEMENT_CONFIGMAP_PREFIX) {
+                return false;
+            }
+            if let Some(data) = &configmap.data {
+                let keep = data.get("keep").unwrap();
+                let start = data.get("start").unwrap();
+                info!("Got configmap {} with data: {:?}", &configmap_name, data);
+                // TODO(rustielin): come up with some sane values for namespaces
+                let start: u64 = start.parse().unwrap();
+                let keep: bool = keep.parse().unwrap();
+                let namespace_uptime = since_the_epoch - start;
+                info!(
+                    "Namespace {} has lived for {}/{} seconds",
+                    configmap_namespace, namespace_uptime, NAMESPACE_CLEANUP_THRESHOLD_SECS
+                );
+                if keep {
+                    info!("Explicitly keeping namespace {}", configmap_namespace);
+                    return false;
+                }
+                if namespace_uptime > NAMESPACE_CLEANUP_THRESHOLD_SECS {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect::<Vec<ConfigMap>>();
+    for configmap in configmaps {
+        let namespace = configmap.namespace().unwrap();
+        uninstall_testnet_resources(namespace).await?;
+    }
+
+    Ok(())
 }
